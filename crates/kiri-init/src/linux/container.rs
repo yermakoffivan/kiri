@@ -258,7 +258,8 @@ pub fn spawn(spec: &RunSpec<'_>, paths: &Paths, net: NetCtx<'_>) -> io::Result<P
     // Small, short-lived files: kept in memory (/run is tmpfs), not on the data disk.
     let etc_dir = PathBuf::from("/run/kiri").join(spec.id);
     let embedded_dns = embedded_dns(spec, net.upstream_dns, net.dns.relay);
-    prepared.etc_files = write_etc_files(spec, &etc_dir, net.upstream_dns, embedded_dns).map_err(cleanup)?;
+    let nameserver = embedded_dns.then(|| embedded_address(spec, net.dns.relay));
+    prepared.etc_files = write_etc_files(spec, &etc_dir, net.upstream_dns, nameserver).map_err(cleanup)?;
     prepared.mounts = parse_mounts(spec.mounts).map_err(cleanup)?;
     let bridged = !spec.net.bridge.is_empty() && spec.flags & (run_flags::NET_HOST | run_flags::NET_NONE) == 0 && prepared.net_join.is_none();
     let mut go = None;
@@ -672,7 +673,7 @@ fn prepare(argv: StrList<'_>, env: StrList<'_>, cwd: &str, user: &str, hostname:
 
 /// Writes the container's /etc/hosts, /etc/resolv.conf and /etc/hostname
 /// beside its writable layer; the child binds them over the image's files.
-fn write_etc_files(spec: &RunSpec<'_>, base: &std::path::Path, upstream: &[[u8; 4]], embedded_dns: bool) -> io::Result<Vec<(CString, CString)>> {
+fn write_etc_files(spec: &RunSpec<'_>, base: &std::path::Path, upstream: &[[u8; 4]], embedded: Option<[u8; 4]>) -> io::Result<Vec<(CString, CString)>> {
     fs::create_dir_all(base)?;
     // `--network container:<id>` shares that container's files, as Docker does.
     if let Some(target) = net_opts::values(spec.net.opts, net_opts::NETNS).next() {
@@ -719,7 +720,7 @@ fn write_etc_files(spec: &RunSpec<'_>, base: &std::path::Path, upstream: &[[u8; 
         }
         hosts.push('\n');
     }
-    let resolv = resolv_conf(spec, upstream, embedded_dns);
+    let resolv = resolv_conf(spec, upstream, embedded);
     let files = [("hosts", hosts), ("resolv.conf", resolv), ("hostname", format!("{}\n", spec.hostname))];
     let mut out = Vec::with_capacity(files.len());
     for (name, text) in files {
@@ -750,11 +751,23 @@ fn embedded_dns(spec: &RunSpec<'_>, upstream: &[[u8; 4]], relay: bool) -> bool {
     bridged && net_opts::values(spec.net.opts, net_opts::NAMESERVER).next().is_none() && (relay || net::local_resolver(upstream))
 }
 
-fn resolv_conf(spec: &RunSpec<'_>, upstream: &[[u8; 4]], embedded_dns: bool) -> String {
+/// The address a container that uses the agent's resolver names in its
+/// resolv.conf: 127.0.0.11 on a user network, as Docker's embedded DNS;
+/// on the default bridge in the VM, the bridge's gateway, where the agent
+/// answers too. Not a loopback address there, because what runs builds
+/// in a container takes loopback nameservers out of the copy it gives
+/// each step and puts Google's in their place (BuildKit does, for every
+/// step that isn't `--network=host`): those steps would ask 8.8.8.8, not
+/// the Mac's resolver, and VPN and company names would stop resolving.
+fn embedded_address(spec: &RunSpec<'_>, relay: bool) -> [u8; 4] {
+    if relay && spec.flags & run_flags::DNS_GATEWAY == 0 && spec.net.gateway != [0; 4] { spec.net.gateway } else { super::dns::EMBEDDED }
+}
+
+fn resolv_conf(spec: &RunSpec<'_>, upstream: &[[u8; 4]], embedded: Option<[u8; 4]>) -> String {
     let mut resolv = String::new();
     let mut servers = net_opts::values(spec.net.opts, net_opts::NAMESERVER).peekable();
-    if embedded_dns {
-        resolv.push_str(&format!("nameserver {}\n", net::ip_str(super::dns::EMBEDDED)));
+    if let Some(ns) = embedded {
+        resolv.push_str(&format!("nameserver {}\n", net::ip_str(ns)));
     } else if servers.peek().is_some() {
         for d in servers {
             resolv.push_str(&format!("nameserver {d}\n"));
@@ -1362,7 +1375,7 @@ mod tests {
         let net = Net { bridge: "kiri1", ip: [10, 5, 0, 2], prefix: 24, gateway: [10, 5, 0, 1], extra_hosts: &[], dns_names: &[], opts };
         encode_run(&mut buf, "c1", &[], &["sh"], &[], "/", "", "c1", flags, net, &[], &Limits::default(), 0, &[] as &[&str]);
         let Ok(Msg::Run(spec)) = decode(&buf) else { panic!() };
-        super::resolv_conf(&spec, upstream, flags & run_flags::DNS_GATEWAY != 0)
+        super::resolv_conf(&spec, upstream, (flags & run_flags::DNS_GATEWAY != 0).then_some(super::super::dns::EMBEDDED))
     }
 
     #[test]
@@ -1399,6 +1412,13 @@ mod tests {
         spec_with(0, &[], &|s| assert!(super::embedded_dns(s, &gateway, true), "so a refused gateway can fall back to the host"));
         spec_with(0, &["nameserver=8.8.8.8"], &|s| assert!(!super::embedded_dns(s, &gateway, true), "--dns servers are asked directly"));
         spec_with(run_flags::NET_HOST, &[], &|s| assert!(!super::embedded_dns(s, &gateway, true), "host networking keeps the VM's resolv.conf"));
+        // Named by the bridge's gateway, not 127.0.0.11: builders keep it
+        // for their steps rather than swapping in 8.8.8.8.
+        spec_with(0, &[], &|s| assert_eq!(super::embedded_address(s, true), [172, 17, 0, 1]));
+        spec_with(0, &[], &|s| assert_eq!(super::resolv_conf(s, &gateway, Some(super::embedded_address(s, true))), "nameserver 172.17.0.1\n"));
+        // A user network keeps Docker's 127.0.0.11, as does a Linux host.
+        spec_with(run_flags::DNS_GATEWAY, &[], &|s| assert_eq!(super::embedded_address(s, true), super::super::dns::EMBEDDED));
+        spec_with(0, &[], &|s| assert_eq!(super::embedded_address(s, false), super::super::dns::EMBEDDED));
     }
 
     #[test]

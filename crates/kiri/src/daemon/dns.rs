@@ -10,8 +10,9 @@
 
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, SocketAddr, UdpSocket};
+use std::os::fd::AsRawFd;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 /// The resolver file's port; unprivileged, so the daemon needs no root.
@@ -84,36 +85,82 @@ fn answer(q: &[u8]) -> Option<Vec<u8>> {
 const RELAY_TRY: Duration = Duration::from_millis(1500);
 /// All the resolvers together: the agent stops waiting at five seconds.
 const RELAY_BUDGET: Duration = Duration::from_millis(3500);
+/// How long the agent gets to send its query, and to take the reply.
+const RELAY_IO: Duration = Duration::from_secs(5);
+/// Relayed lookups at once, as many as the agent itself keeps in flight;
+/// more are dropped (the client asks again).
+const MAX_RELAYS: usize = 256;
+static RELAYS: AtomicUsize = AtomicUsize::new(0);
 
 /// One lookup from the guest agent: `u16 len | query` in, `u16 len | reply`
 /// out (kiri_proto::DNS_RELAY_PORT). The agent sends here only what the
 /// VM's gateway resolver refused or left unanswered, so this is the path
 /// while macOS's resolver for the VM network is down.
 pub fn serve_relay(stream: kiri_vmm::VsockStream) {
-    let _ = std::thread::Builder::new().name("kiri-dns-relay".into()).spawn(move || {
-        let Ok(fd) = stream.fd.try_clone() else { return };
-        let mut conn = std::fs::File::from(fd);
-        let mut len = [0u8; 2];
-        if conn.read_exact(&mut len).is_err() {
-            return;
-        }
-        let mut query = vec![0u8; u16::from_be_bytes(len) as usize];
-        if query.len() < 12 || conn.read_exact(&mut query).is_err() {
-            return;
-        }
-        static SAID: AtomicBool = AtomicBool::new(false);
-        if !SAID.swap(true, Ordering::Relaxed) {
-            crate::diag::warn!("the VM's DNS at its gateway did not answer; container lookups go through the Mac");
-        }
-        let name = question_name(&query).unwrap_or_default();
-        let servers = mac_resolvers(&name, Path::new("/etc/resolv.conf"), Path::new("/etc/resolver"));
-        let reply = relay_query(&query, &servers).unwrap_or_else(|| servfail(&query));
-        let mut out = Vec::with_capacity(2 + reply.len());
-        out.extend_from_slice(&(reply.len().min(u16::MAX as usize) as u16).to_be_bytes());
-        out.extend_from_slice(&reply[..reply.len().min(u16::MAX as usize)]);
-        let _ = conn.write_all(&out);
-        drop(stream);
+    if RELAYS.fetch_add(1, Ordering::Relaxed) >= MAX_RELAYS {
+        RELAYS.fetch_sub(1, Ordering::Relaxed);
+        return;
+    }
+    let spawned = std::thread::Builder::new().name("kiri-dns-relay".into()).spawn(move || {
+        relay_one(&stream);
+        RELAYS.fetch_sub(1, Ordering::Relaxed);
     });
+    if spawned.is_err() {
+        RELAYS.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+fn relay_one(stream: &kiri_vmm::VsockStream) {
+    let Ok(fd) = stream.fd.try_clone() else { return };
+    // A peer that connects and then says nothing doesn't keep a thread.
+    // Best effort: without the timeouts the lookup still works.
+    if let Err(e) = set_timeouts(fd.as_raw_fd(), RELAY_IO) {
+        crate::diag::debug!("DNS relay: no socket timeouts", error = e);
+    }
+    let mut conn = std::fs::File::from(fd);
+    let mut len = [0u8; 2];
+    if conn.read_exact(&mut len).is_err() {
+        return;
+    }
+    let mut query = vec![0u8; u16::from_be_bytes(len) as usize];
+    if conn.read_exact(&mut query).is_err() || !is_query(&query) {
+        return;
+    }
+    static SAID: AtomicBool = AtomicBool::new(false);
+    if !SAID.swap(true, Ordering::Relaxed) {
+        crate::diag::warn!("the VM's DNS at its gateway did not answer; container lookups go through the Mac");
+    }
+    let name = question_name(&query).unwrap_or_default();
+    let servers = mac_resolvers(&name, Path::new("/etc/resolv.conf"), Path::new("/etc/resolver"));
+    let reply = relay_query(&query, &servers).unwrap_or_else(|| servfail(&query));
+    let mut out = Vec::with_capacity(2 + reply.len());
+    out.extend_from_slice(&(reply.len().min(u16::MAX as usize) as u16).to_be_bytes());
+    out.extend_from_slice(&reply[..reply.len().min(u16::MAX as usize)]);
+    let _ = conn.write_all(&out);
+}
+
+/// Whether `q` is a standard DNS query with one well-formed question: the
+/// only thing the agent sends, and so all that's passed to the Mac's
+/// resolvers (some of which listen on the Mac's loopback).
+fn is_query(q: &[u8]) -> bool {
+    q.len() >= 12
+        && q[2] & 0x80 == 0 // QR: a query
+        && (q[2] >> 3) & 0x0f == 0 // OPCODE: QUERY
+        && u16::from_be_bytes([q[4], q[5]]) == 1
+        && q[6..8] == [0, 0] // no answers
+        && question_end(q).is_some()
+}
+
+fn set_timeouts(fd: std::os::fd::RawFd, t: Duration) -> io::Result<()> {
+    let tv = libc::timeval { tv_sec: t.as_secs() as _, tv_usec: t.subsec_micros() as _ };
+    let len = std::mem::size_of::<libc::timeval>() as libc::socklen_t;
+    for opt in [libc::SO_RCVTIMEO, libc::SO_SNDTIMEO] {
+        // SAFETY: a valid timeval for a socket option on a descriptor we hold.
+        if unsafe { libc::setsockopt(fd, libc::SOL_SOCKET, opt, (&tv as *const libc::timeval).cast(), len) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
 }
 
 /// The first answer to `query` from `servers`, tried in order.
@@ -303,6 +350,24 @@ mod tests {
         resolver.join().unwrap();
         assert_eq!((&r[..2], r[2] & 0x80, &r[12..]), (&q[..2], 0x80, &q[12..]));
         assert_eq!(super::question_name(&q).as_deref(), Some("registry-1.docker.io"));
+    }
+
+    #[test]
+    fn only_standard_queries_are_relayed() {
+        let q = query("registry-1.docker.io", 1);
+        assert!(super::is_query(&q));
+        let mut reply = q.clone();
+        reply[2] |= 0x80;
+        assert!(!super::is_query(&reply), "a response");
+        let mut update = q.clone();
+        update[2] = 5 << 3;
+        assert!(!super::is_query(&update), "an UPDATE");
+        let mut two = q.clone();
+        two[5] = 2;
+        assert!(!super::is_query(&two), "two questions");
+        assert!(!super::is_query(&q[..q.len() - 1]), "cut short");
+        assert!(!super::is_query(&[0x12, 0x34, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0xc0, 12, 0, 1, 0, 1]), "a compression pointer");
+        assert!(!super::is_query(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n"), "not DNS at all");
     }
 
     #[test]

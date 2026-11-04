@@ -85,6 +85,35 @@ pub fn dial(port: u32) -> io::Result<OwnedFd> {
     }
 }
 
+/// `SO_VM_SOCKETS_CONNECT_TIMEOUT` (linux/vm_sockets.h, the `_OLD` value,
+/// which takes a native `timeval`; libc doesn't name it).
+const SO_VM_SOCKETS_CONNECT_TIMEOUT: libc::c_int = 6;
+
+/// Like `dial`, but a connection the host doesn't take within `timeout`
+/// fails (vsock waits two seconds by default), for callers in the agent's
+/// loop, which nothing else runs in while it waits.
+pub fn dial_within(port: u32, timeout: std::time::Duration) -> io::Result<OwnedFd> {
+    if host_dir().is_some() {
+        return dial(port); // a unix socket: connect never waits
+    }
+    // SAFETY: plain socket setup and connect; the fd is owned immediately.
+    unsafe {
+        let fd = sys::check(libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) as _, "vsock socket")?;
+        let sock = OwnedFd::from_raw_fd(fd as RawFd);
+        let tv = libc::timeval { tv_sec: timeout.as_secs() as _, tv_usec: timeout.subsec_micros() as _ };
+        sys::check(
+            libc::setsockopt(sock.as_raw_fd(), libc::AF_VSOCK, SO_VM_SOCKETS_CONNECT_TIMEOUT, (&tv as *const libc::timeval).cast(), std::mem::size_of::<libc::timeval>() as u32) as _,
+            "vsock connect timeout",
+        )?;
+        let mut addr: libc::sockaddr_vm = std::mem::zeroed();
+        addr.svm_family = libc::AF_VSOCK as libc::sa_family_t;
+        addr.svm_cid = VMADDR_CID_HOST;
+        addr.svm_port = port;
+        sys::check(libc::connect(sock.as_raw_fd(), (&addr as *const libc::sockaddr_vm).cast(), std::mem::size_of::<libc::sockaddr_vm>() as u32) as _, "vsock connect")?;
+        Ok(sock)
+    }
+}
+
 /// The host's own DNS servers, for a host process (no DHCP lease to ask).
 /// systemd-resolved's stub (127.0.0.53) is skipped for its upstreams.
 pub fn host_dns() -> Vec<[u8; 4]> {

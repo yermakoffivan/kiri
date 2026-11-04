@@ -33,6 +33,15 @@ const FORWARD_TIMEOUT: Duration = Duration::from_secs(5);
 /// At most this many forwarded queries in flight (each has its own socket);
 /// more are dropped, and the client asks again.
 const MAX_PENDING: usize = 256;
+/// At most this many of them from one container (or one address on a
+/// bridge), so a container flooding lookups can't take DNS from the rest.
+const MAX_PER_CLIENT: usize = 64;
+/// How long the agent's loop may wait for the host to take a relayed
+/// lookup's connection.
+const RELAY_CONNECT: Duration = Duration::from_millis(250);
+/// After the host failed to take one, lookups aren't relayed for this long:
+/// each would stall the loop for `RELAY_CONNECT` again.
+const RELAY_BACKOFF: Duration = Duration::from_secs(5);
 /// A lookup the VM's resolver hasn't answered within this goes through the
 /// host (VM only). Gateway answers take milliseconds; a slow recursive one
 /// that loses the race is simply replaced by the host's.
@@ -62,6 +71,8 @@ struct Pending {
     sock: OwnedFd,
     /// The ID it went out with.
     our: u16,
+    /// Who asked, for `MAX_PER_CLIENT`: the container's address.
+    key: [u8; 4],
     /// The server's socket the query came in on.
     server: RawFd,
     client: libc::sockaddr_in,
@@ -94,6 +105,8 @@ pub struct Dns {
     /// Lookups the VM's resolver fails go through the host (in the VM; a
     /// Linux host's agent asks the host's resolvers itself).
     pub relay: bool,
+    /// The host didn't take a relayed lookup: none are tried until then.
+    relay_down_until: Option<Instant>,
 }
 
 fn udp_socket() -> io::Result<OwnedFd> {
@@ -342,7 +355,7 @@ impl Dns {
         self.pending.retain(|p| now.duration_since(p.sent) < FORWARD_TIMEOUT);
         let key = self.servers[server].container.map_or(client.sin_addr.s_addr.to_ne_bytes(), |(_, owner)| owner);
         let own = self.clients.get(&key).and_then(|v| v.first()).copied();
-        if self.pending.len() >= MAX_PENDING {
+        if self.pending.len() >= MAX_PENDING || self.pending.iter().filter(|p| p.key == key).count() >= MAX_PER_CLIENT {
             return;
         }
         let Some((_, _, end)) = parse_question(q) else {
@@ -357,7 +370,7 @@ impl Dns {
         // No resolver yet, or it can't be reached: the host, if allowed.
         let (sock, relayed) = match dest.and_then(|d| ask(d, &msg)) {
             Some(s) => (s, false),
-            None if may_relay => match relay_stream(&msg) {
+            None if may_relay => match self.relay_stream(&msg) {
                 Some(s) => (s, true),
                 None => return,
             },
@@ -366,6 +379,7 @@ impl Dns {
         let p = Pending {
             sock,
             our,
+            key,
             server: self.servers[server].sock.as_raw_fd(),
             client,
             id,
@@ -389,12 +403,15 @@ impl Dns {
 
     /// Sends pending query `at` again, through the host, once.
     fn relay(&mut self, at: usize) {
-        let p = &mut self.pending[at];
-        if !p.may_relay {
+        if !self.pending[at].may_relay {
             return;
         }
-        p.may_relay = false;
-        if let Some(stream) = relay_stream(&p.query) {
+        self.pending[at].may_relay = false;
+        let query = std::mem::take(&mut self.pending[at].query);
+        let stream = self.relay_stream(&query);
+        let p = &mut self.pending[at];
+        p.query = query;
+        if let Some(stream) = stream {
             p.sock = stream;
             p.relayed = Some(Vec::new());
             p.sent = Instant::now();
@@ -443,6 +460,29 @@ impl Dns {
         }
     }
 
+    /// A stream to the host's DNS relay with `msg` sent on it, non-blocking
+    /// for the reply; None while the host is taken for down.
+    fn relay_stream(&mut self, msg: &[u8]) -> Option<OwnedFd> {
+        if self.relay_down_until.is_some_and(|t| Instant::now() < t) {
+            return None;
+        }
+        let Ok(stream) = super::transport::dial_within(kiri_proto::DNS_RELAY_PORT, RELAY_CONNECT) else {
+            self.relay_down_until = Some(Instant::now() + RELAY_BACKOFF);
+            return None;
+        };
+        self.relay_down_until = None;
+        let mut frame = Vec::with_capacity(2 + msg.len());
+        frame.extend_from_slice(&u16::try_from(msg.len()).ok()?.to_be_bytes());
+        frame.extend_from_slice(msg);
+        // A few hundred bytes on a fresh stream: one write, never short.
+        // SAFETY: writing a buffer we own to a socket we own.
+        if unsafe { libc::write(stream.as_raw_fd(), frame.as_ptr().cast(), frame.len()) } != frame.len() as isize {
+            return None;
+        }
+        sys::set_nonblocking(stream.as_raw_fd()).ok()?;
+        Some(stream)
+    }
+
     /// Sends lookups the VM's resolver has left unanswered too long
     /// through the host. Called on every turn of the agent's loop.
     pub fn on_timer(&mut self) {
@@ -482,22 +522,6 @@ fn ask(dest: [u8; 4], msg: &[u8]) -> Option<OwnedFd> {
         return None;
     }
     Some(sock)
-}
-
-/// A stream to the host's DNS relay with `msg` sent on it, non-blocking
-/// for the reply.
-fn relay_stream(msg: &[u8]) -> Option<OwnedFd> {
-    let stream = super::transport::dial(kiri_proto::DNS_RELAY_PORT).ok()?;
-    let mut frame = Vec::with_capacity(2 + msg.len());
-    frame.extend_from_slice(&u16::try_from(msg.len()).ok()?.to_be_bytes());
-    frame.extend_from_slice(msg);
-    // A few hundred bytes on a fresh stream: one write, never short.
-    // SAFETY: writing a buffer we own to a socket we own.
-    if unsafe { libc::write(stream.as_raw_fd(), frame.as_ptr().cast(), frame.len()) } != frame.len() as isize {
-        return None;
-    }
-    sys::set_nonblocking(stream.as_raw_fd()).ok()?;
-    Some(stream)
 }
 
 /// The reply in `u16 len | reply`, once all of it is there.
@@ -725,6 +749,7 @@ mod tests {
         Pending {
             sock: udp_socket().unwrap(),
             our: 1,
+            key: [0; 4],
             server: -1,
             client: unsafe { std::mem::zeroed() },
             id: 7,
@@ -734,6 +759,35 @@ mod tests {
             may_relay: false,
             relayed: None,
         }
+    }
+
+    #[test]
+    fn one_client_cant_take_every_forwarded_slot() {
+        let mut dns = Dns::default();
+        dns.servers.push(Server { bridges: vec!["kiri0".into()], sock: udp_socket().unwrap(), container: None });
+        let client = super::sockaddr([172, 17, 0, 2], 4000);
+        for _ in 0..super::MAX_PER_CLIENT {
+            let mut p = pending();
+            p.key = [172, 17, 0, 2];
+            dns.pending.push(p);
+        }
+        let q = query("example.com", 1);
+        // Loopback as the resolver: sending always works.
+        dns.forward(0, &q, client, &[[127, 0, 0, 1]]);
+        assert_eq!(dns.pending.len(), super::MAX_PER_CLIENT, "that container's next lookup waits");
+        dns.forward(0, &q, super::sockaddr([172, 17, 0, 3], 4000), &[[127, 0, 0, 1]]);
+        assert_eq!(dns.pending.len(), super::MAX_PER_CLIENT + 1, "another container's goes out");
+    }
+
+    #[test]
+    fn a_host_that_didnt_answer_isnt_dialled_again_at_once() {
+        let mut dns = Dns { relay: true, ..Default::default() };
+        // No host to dial in a test: the first try fails and backs off.
+        assert!(dns.relay_stream(b"query").is_none());
+        let until = dns.relay_down_until.expect("backing off");
+        assert!(until > Instant::now());
+        assert!(dns.relay_stream(b"query").is_none());
+        assert_eq!(dns.relay_down_until, Some(until), "not tried again while backing off");
     }
 
     #[test]
